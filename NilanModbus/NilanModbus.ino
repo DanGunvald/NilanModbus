@@ -5,6 +5,14 @@
 #include <PubSubClient.h>
 
 
+#define HOST "modbusgw-%s"
+#define MAXREGSIZE 26
+#define SENDINTERVAL 180000
+#define VENTSET 1003
+#define RUNSET 1001
+#define MODESET 1002
+#define TEMPSET 1004
+
 const char* ssid = "<ssid>";
 const char* password = "<password>";
 char chipid[12];
@@ -12,14 +20,10 @@ const char* mqttserver="<mqttserver>";
 WiFiServer server(80);
 WiFiClient client;
 PubSubClient mqttclient(client);
-
-#define HOST "modbusgw-%s"
-#define MAXREGSIZE 26
-#define SENDINTERVAL 180000
-
-
-
+static long lastMsg = -SENDINTERVAL;
+static int16_t rsbuffer[MAXREGSIZE];
 ModbusMaster node;
+
 String req[4];//operation, group, address, value
 enum reqtypes {
   reqtemp=0,
@@ -40,6 +44,7 @@ enum reqtypes {
   reqdisplay2,
   reqmax
 };
+
 String groups[] ={"temp","alarm","time","control","speed","airtemp","airflow","airheat", "user", "user2", "info", "inputairtemp", "app", "output", "display1","display2"};
 byte regsizes[] =     {23, 10, 6,  8,   2,  6,   2,   0, 6,  6,  14, 7,   4, 26, 4,   4};
 int  regaddresses[] = {200,400,300,1000,200,1200,1100,0, 600,610,100,1200,0, 100,2002,2007 };
@@ -84,10 +89,8 @@ char * getName(reqtypes type, int address) {
     return regnames[type][address];
   }
   return NULL;
-  
 }
 
-static int16_t rsbuffer[MAXREGSIZE];
 
 JsonObject&  HandleRequest(JsonBuffer& jsonBuffer) {
   JsonObject& root = jsonBuffer.createObject();
@@ -130,15 +133,12 @@ JsonObject&  HandleRequest(JsonBuffer& jsonBuffer) {
     root["requestnum"] = nums;
   }
   if (req[0] == "set" && req[2] != "" && req[3] != "") {
-    int addtoaddress = 0;//type==0?30000:40000;
     int address = atoi(req[2].c_str());
     int value = atoi(req[3].c_str());
-    char result = WriteModbus(address + addtoaddress, value);
+    char result = WriteModbus(address , value);
     root["result"] = result;
-    root["address"] = address + addtoaddress;
+    root["address"] = address;
     root["value"] = value;
-
-
   }
   if (req[0] == "help") {
     for (int i = 0; i < reqmax; i++) {
@@ -158,7 +158,6 @@ void setup() {
   delay(500);
   WiFi.hostname(host);
   ArduinoOTA.setHostname(host);
-
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
   while (WiFi.waitForConnectResult() != WL_CONNECTED) {
@@ -166,7 +165,6 @@ void setup() {
     ESP.restart();
   }
   ArduinoOTA.onStart([]() {
-
   });
   ArduinoOTA.onEnd([]() {
   });
@@ -179,10 +177,40 @@ void setup() {
   Serial.begin(19200,SERIAL_8E1);
   node.begin(30, Serial);
 
-
   mqttclient.setServer(mqttserver, 1883);
+  mqttclient.setCallback(mqttcallback);
 }
 
+void mqttcallback(char* topic, byte* payload, unsigned int length) {
+  if (strcmp(topic, "ventilation/ventset") == 0) {
+    if (length == 1 && payload[0] >= '0' && payload[0] <= '4') {
+      int16_t speed = payload[0] - '0';
+      WriteModbus(VENTSET,speed);  
+    }
+  }
+  if (strcmp(topic, "ventilation/modeset") == 0) {
+    if (length == 1 && payload[0] >= '0' && payload[0] <= '4') {
+      int16_t mode = payload[0] - '0';
+      WriteModbus(MODESET,mode);  
+    }
+  }
+  if (strcmp(topic, "ventilation/runset") == 0) {
+    if (length == 1 && payload[0] >= '0' && payload[0] <= '1') {
+      int16_t run = payload[0] - '0';
+      WriteModbus(RUNSET,run);  
+    }
+  }
+  if (strcmp(topic, "ventilation/tempset") == 0) {
+    if (length == 4 && payload[0] >= '0' && payload[0] <= '2') {
+      String str;
+      for (int i = 0; i < length; i++) {
+        str += (char)payload[i];
+      }
+      WriteModbus(TEMPSET,str.toInt());  
+    }
+  }
+  lastMsg = -SENDINTERVAL;
+}
 
 bool readRequest(WiFiClient& client) {
   req[0] = "";
@@ -218,7 +246,6 @@ void writeResponse(WiFiClient& client, JsonObject& json) {
   json.prettyPrintTo(client);
 }
 
-static uint32_t shiti;
 char ReadModbus(uint16_t addr, uint8_t sizer, int16_t* vals, int type) {
   char result = 0;
   switch (type) {
@@ -244,14 +271,16 @@ char WriteModbus(uint16_t addr, int16_t val) {
   return result;
 }
 
-static long lastMsg = 0;
 
 
 void mqttreconnect() {
   int numretries = 0;
   while (!mqttclient.connected() && numretries < 3) {
     if (mqttclient.connect(chipid)) {
-      //mqttclient.subscribe("");
+      mqttclient.subscribe("ventilation/ventset");
+      mqttclient.subscribe("ventilation/modeset");
+      mqttclient.subscribe("ventilation/runset");
+      mqttclient.subscribe("ventilation/tempset");
     } else {
       delay(1000);
     }
@@ -285,20 +314,28 @@ void loop() {
     mqttclient.loop();
     long now = millis();
     if (now - lastMsg > SENDINTERVAL) {
-          char result = ReadModbus(regaddresses[reqtemp],regsizes[reqtemp], rsbuffer, regtypes[reqtemp]& 1);
-      if (result == 0) {
-        for (int i = 0; i < regsizes[reqtemp] ; i++) {
-          char *name = getName(reqtemp,i);
-          char numstr[8];
-          if (name != NULL && strlen(name) > 0) {
-            String mqname = "temp/";
-            
-            if (strncmp("RH", name,2) == 0) {
-              mqname = "moist/Nilan";
-            }
-            mqname += (char*)name;
-            mqttclient.publish(mqname.c_str(),dtostrf((rsbuffer[i]/100.0), 5,2,numstr));
-          } 
+      for (int i = 0; i < 2; i++) {
+        reqtypes r = i==0?reqtemp:reqcontrol;
+        char result = ReadModbus(regaddresses[r],regsizes[r], rsbuffer, regtypes[r]& 1);
+        if (result == 0) {
+          for (int i = 0; i < regsizes[r] ; i++) {
+            char *name = getName(r,i);
+            char numstr[8];
+            if (name != NULL && strlen(name) > 0) {
+              String mqname = "temp/";
+              if (r == reqcontrol) {
+                mqname = "ventilation/control/";
+                itoa((rsbuffer[i]),numstr,10);
+              } else {
+                if (strncmp("RH", name,2) == 0) {
+                  mqname = "moist/Nilan";
+                }
+                dtostrf((rsbuffer[i]/100.0), 5,2,numstr);
+              }
+              mqname += (char*)name;
+              mqttclient.publish(mqname.c_str(),numstr);
+            } 
+          }
         }
       }
       lastMsg = now;
